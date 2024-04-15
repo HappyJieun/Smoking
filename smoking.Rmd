@@ -1,0 +1,386 @@
+---
+title: "Machine learning-based smoking status prediction modeling using  biosignal
+  data"
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+date: "2024-02-01"
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r}
+## set Repositories
+setRepositories(ind = 1:7)
+
+## set working dir.
+setwd("/disk7/bilje/T-SUM/final/")
+```
+
+```{r}
+# load library
+library(ggplot2) 
+library(caret)
+library(dplyr)
+library(readr)
+library(data.table)
+library(stats)
+library(corrplot)
+library(doParallel) 
+library(gridExtra)
+library(xgboost)
+```
+
+```{r echo=FALSE}
+#**원시 데이터 불러오기**
+smk_df <- fread('./smoking.csv', stringsAsFactors = T)
+```
+
+```{r}
+glimpse(smk_df)
+```
+
+## Data preprocessing
+
+```{r}
+#**id열 제거**
+smk_df <- smk_df[,2:length(colnames(smk_df))] 
+
+#**각 변수 이름에 공백이나 괄호를 없애거나 대체**
+colnames(smk_df) <- gsub('\\(| ', '_', colnames(smk_df)) %>% gsub('\\)', '',.)
+smk_col_name<- colnames(smk_df)
+
+#**결측치 확인**
+sum(is.na(smk_df))
+
+#전처리 전 데이터 변수별 plotting할 때 라벨링 용
+smk_df$smoking <- factor(smk_df$smoking, levels = c(0, 1), labels = c("Non-smoker", "Smoker"))
+
+# smoking 유무는 binary인걸 이미 알고 있기 때문에 제거
+smk_col_name <- smk_col_name[1:length(smk_col_name)-1]
+
+```
+
+## 시각화
+
+```{r}
+plots <- list()
+for (name in smk_col_name){
+  p <- ggplot(smk_df, aes(x = .data[[name]], color = as.factor(smoking)))+ #aes(x=안에는 name으로 쓰면 곧이곧대로 인식함 .data가 일종의 대명사 역할함)
+    geom_density(alpha = 0.5, linetype = 1)
+  print(p)
+}
+```
+
+```{r}
+#**plot확인해 연속형과 이산형 변수명을 리스트로 저장**
+
+disc_col <- c('dental_caries', 'Urine_protein', 'hearing_left', 'hearing_right')
+cont_col <- setdiff(colnames(smk_df), c(disc_col, 'smoking'))
+
+#이산형 변수들 factor로 바꿈 
+for (name in disc_col){
+  smk_df[[name]] <- as.factor(smk_df[[name]])
+}
+smk_df %>% select(disc_col) %>% glimpse()
+```
+
+```{r}
+#**continuous 변수에 대해 plotting 방법 1. density**
+for (name in cont_col){
+  smk_df_tmp <- smk_df %>% #**smoking과 name으로 그룹화**
+    group_by(!!sym(name), smoking) %>% 
+    summarise(count = n()) %>% #**각 경우의 수마다 존재하는 count수를 데이터 프레임으로**
+    ungroup() %>%
+    mutate(ratio = count / sum(count))
+  
+  smk_df_tmp$smoking <- factor(smk_df_tmp$smoking, levels = c(0, 1), labels = c("Non-smoker", "Smoker"))
+  p <- ggplot(smk_df, aes(x = !!sym(name), color = factor(smoking)))+ 
+    geom_density(alpha = 0.5, linetype = 1)+
+    theme(legend.text = element_text(size = 15), legend.title = element_text(size = 18))
+ print(p)
+}
+```
+
+```{r}
+#**discrete 변수에 대해 plotting 방법 1. barplot**
+for (name in disc_col){
+  smk_df_tmp <- smk_df %>% #**smoking과 name으로 그룹화**
+    group_by(!!sym(name), smoking) %>% 
+    dplyr::summarise(count = n()) %>% #**각 경우의 수마다 존재하는 count수를 데이터 프레임으로**
+    ungroup() %>%
+    mutate(ratio = count / sum(count))
+  
+  smk_df_tmp$smoking <- factor(smk_df_tmp$smoking, levels = c(0, 1), labels = c("Non-smoker", "Smoker"))
+  
+  p <- ggplot(smk_df_tmp, aes(x = !!sym(name), y = ratio, group = factor(smoking), fill = factor(smoking))) +
+    geom_bar(position = 'dodge', stat = 'identity', width = 0.3)+
+    labs(title = sprintf("Box Plot for discrete column: %s", name), size = 17)+
+    geom_text(aes(label = sprintf('%.0f\n%.2f',count,ratio)), position = position_dodge(width = 0.9), vjust = 0.5, size=2)+
+    theme(legend.text = element_text(size = 1), legend.title = element_text(size = 5))+
+    ylim(0,1) +
+    scale_fill_manual(values = c("Non-smoker" = "pink", "Smoker" = "skyblue"))
+  
+  print(p)
+  }
+```
+
+## 이상치 탐지 및 처리
+
+```{r}
+#**연속형 변수를 boxplot으로 시각화, 이상치 값 확인** 
+data_continuous <- smk_df %>% 
+  dplyr::select(all_of(cont_col))
+for (col_name in cont_col) {
+  # 박스플롯과 이상치 시각화
+  p <- ggplot(data_continuous, aes(x = 1, y = !!sym(col_name))) +
+    geom_boxplot() +
+    labs(title = col_name)
+  
+  # 이상치 식별
+  stats <- boxplot.stats(data_continuous[[col_name]])
+  outliers <- stats$out
+  
+  # 이상치 라벨링
+  p <- p + geom_text(data = data.frame(x = 1.05, y = outliers, label = round(outliers, 2)),
+                     aes(x = x, y = y, label = label), color = "blue", hjust = 1, vjust = 0.5, size = 3.5)
+  print(p)
+}
+```
+
+```{r}
+#**이상치 제거**
+# 데이터 준비
+smk_df_cor <- fread('./smoking.csv', stringsAsFactors = T)
+disc_co <- c("id", "hearing(left)", "hearing(right)", "Urine protein", "dental caries", "smoking")
+df_selected <- smk_df_cor %>% 
+  dplyr::select(-all_of(disc_co))
+```
+
+```{r}
+# 각 열의 IQR 계산
+Q1 <- apply(df_selected, 2, quantile, probs = 0.25, na.rm = TRUE)
+Q3 <- apply(df_selected, 2, quantile, probs = 0.75, na.rm = TRUE)
+IQR <- Q3 - Q1
+```
+
+```{r}
+# 이상치 제거
+for (col in colnames(df_selected)) {
+  lower_bound <- Q1[col] - 1.5 * IQR[col]
+  upper_bound <- Q3[col] + 1.5 * IQR[col]
+  df_clean <- smk_df_cor[which(smk_df_cor[[col]] >= lower_bound & smk_df_cor[[col]] <= upper_bound), ]
+}
+```
+
+## 상관분석
+
+```{r}
+#**데이터 상관계수 확인**
+smk_df_cor <- df_clean[,-1]
+colnames(smk_df_cor) <- gsub('\\(| ', '_', colnames(smk_df_cor)) %>% gsub('\\)', '',.)
+correlation_matrix <- cor(smk_df_cor)
+corrplot(correlation_matrix, 
+         method = "circle", 
+         type = "full", 
+         addCoef.col = "black", 
+         tl.col = "black", 
+         tl.srt = 45, 
+         sig.level = 0.01,
+         number.cex = 0.3,
+         tl.cex = 0.5) 
+```
+
+```{r}
+#**상관계수 절댓값이 0.05미만인 변수 제거**
+df_cor <- as.data.frame(correlation_matrix) %>% 
+  select(., smoking)
+col_all <- rownames(df_cor)
+
+col_nocorr <- col_all[apply(df_cor, 1, function(x) abs(x) < 0.05)]
+col_nocorr <- c("hearing_left", "hearing_right", "systolic", "Urine_protein", "AST")
+
+df_update <- smk_df_cor %>% dplyr::select(-all_of(col_nocorr))
+```
+
+## Scaling - standardization
+
+```{r}
+#**데이터 표준화**
+df_clean <- as.data.table(df_update)
+df_clean %>% glimpse
+
+dis <- c("dental_caries", "smoking")
+#이산형 변수들 factor로 바꿈 
+for (name in dis){
+  df_clean[[name]] <- as.factor(df_clean[[name]])
+}
+df_clean %>% select(all_of(dis)) %>% glimpse()
+
+stand_df <- preProcess(df_clean, method = c('center', 'scale'))
+stand_df <- predict(stand_df, df_clean)
+
+stand_df$smoking <- factor(stand_df$smoking, levels = c(0, 1), labels = c("Non-smoker", "Smoker"))
+```
+
+## Modeling
+
+```{r}
+#**모델링을 위한 train, test 데이터 샘플링**
+set.seed(120)
+
+index <- createDataPartition(stand_df$smoking, p = 0.8, list = FALSE)
+train_data <- stand_df
+train_data <- stand_df[index, 1:(length(train_data) - 1)]
+train_class <- stand_df[index, smoking]
+test_data <- stand_df[-index, ]
+```
+
+```{r}
+## 병렬처리
+core_num_for_para <- makePSOCKcluster(8)
+registerDoParallel(core_num_for_para)
+```
+
+## Training
+
+```{r}
+#**svm 모델**
+svm_model <- train(train_data, as.factor(train_class), method = "svmLinearWeights2",  
+                   trControl = trainControl(method = "cv", number = 10),  
+                   metric = "Accuracy")
+```
+
+```{r}
+#**knn 모델**
+knn_model <- train(train_data, as.factor(train_class), method = "knn",  
+                   trControl = trainControl(method = "cv", number = 10),  
+                   metric = "Accuracy")
+```
+
+```{r}
+#**naive_bayes 모델**
+nb_model <- train(train_data, as.factor(train_class), method = "naive_bayes",  
+                       trControl = trainControl(method = "cv", number = 10), 
+                       metric = "Accuracy")
+```
+
+```{r}
+#**random forest 모델**
+rf_model <- train(train_data, as.factor(train_class), method = "rf", 
+                  trControl = trainControl(method = "cv", number = 10),  
+                  metric = "Accuracy")
+```
+
+```{r}
+#**rpart(CART) 모델**
+rpart_model <- train(train_data, as.factor(train_class), method = "rpart",  
+                       trControl = trainControl(method = "cv", number = 10), 
+                       metric = "Accuracy")
+```
+
+## prediction & evaluation
+
+```{r}
+accuracy <- data.frame(accuracy = c(1:5), Precision = c(1:5), Recall = c(1:5), F1 = c(1:5), row.names = c(1:5))
+rownames(accuracy) <- c('svm', 'knn', 'nb', 'rf', 'rpart')
+```
+
+```{r}
+#**모델의 정확도 평가**
+predictions_svm <- predict(svm_model, test_data)
+conf_matrix_svm <- confusionMatrix(predictions_svm, as.factor(test_data$smoking))
+accuracy[1,1] <- conf_matrix_svm$overall["Accuracy"]
+accuracy[1,2] <- conf_matrix_svm$byClass["Precision"]
+accuracy[1,3] <- conf_matrix_svm$byClass["Recall"]
+accuracy[1,4] <- conf_matrix_svm$byClass["F1"]
+
+predictions_knn <- predict(knn_model, test_data)
+conf_matrix_knn <- confusionMatrix(predictions_knn, as.factor(test_data$smoking))
+accuracy[2,1] <- conf_matrix_knn$overall["Accuracy"]
+accuracy[2,2] <- conf_matrix_knn$byClass["Precision"]
+accuracy[2,3] <- conf_matrix_knn$byClass["Recall"]
+accuracy[2,4] <- conf_matrix_knn$byClass["F1"]
+
+predictions_nb <- predict(nb_model, test_data)
+conf_matrix_nb <- confusionMatrix(predictions_nb, as.factor(test_data$smoking))
+accuracy[3,1] <- conf_matrix_nb$overall["Accuracy"]
+accuracy[3,2] <- conf_matrix_nb$byClass["Precision"]
+accuracy[3,3] <- conf_matrix_nb$byClass["Recall"]
+accuracy[3,4] <- conf_matrix_nb$byClass["F1"]
+
+predictions_rf <- predict(rf_model, test_data)
+conf_matrix_rf <- confusionMatrix(predictions_rf, as.factor(test_data$smoking))
+accuracy[4,1] <- conf_matrix_rf$overall["Accuracy"]
+accuracy[4,2] <- conf_matrix_rf$byClass["Precision"]
+accuracy[4,3] <- conf_matrix_rf$byClass["Recall"]
+accuracy[4,4] <- conf_matrix_rf$byClass["F1"]
+
+predictions_rpart <- predict(rpart_model, test_data)
+conf_matrix_rpart <- confusionMatrix(predictions_rpart, as.factor(test_data$smoking))
+accuracy[5,1] <- conf_matrix_rpart$overall["Accuracy"]
+accuracy[5,2] <- conf_matrix_rpart$byClass["Precision"]
+accuracy[5,3] <- conf_matrix_rpart$byClass["Recall"]
+accuracy[5,4] <- conf_matrix_rpart$byClass["F1"]
+
+for (name in rownames(accuracy)){
+  cat(sprintf('\nConfusion Matrix of %s', name),
+      sprintf('Accuracy (정확도): %.4f', accuracy[name, "F1"]),
+      sprintf('Precision (정밀도): %.4f', accuracy[name, "F1"]),
+      sprintf('Recall (재현율): %.4f', accuracy[name, "Recall"]),
+      sprintf('F1 score: %.4f', accuracy[name, "F1"]), sep = '\n')
+  }
+```
+
+## Confusion matrix
+
+```{r}
+#**confusion matrix 시각화**
+lst <- list(conf_matrix_svm$table,conf_matrix_knn$table,conf_matrix_nb$table, conf_matrix_rf$table, conf_matrix_rpart$table)
+
+for (name in lst){
+  conf_df <- as.data.frame(name)
+  p <- ggplot(data = conf_df, aes(x = Reference, y = Prediction)) +
+    geom_tile(aes(fill = Freq), colour = "white") +
+    geom_text(aes(label = Freq), size = 8) +
+    scale_fill_gradient(low = "white", high = "steelblue") +
+    theme_minimal() +
+    labs(title = "Confusion Matrix", x = "Actual", y = "Predicted")+
+    theme(axis.text.x = element_blank(), axis.text.y = element_blank(), legend.title = element_text(size = 18), legend.text = element_text(size = 15),
+          axis.title = element_text(size = 17), title = element_text(size = 18))
+  print(p)
+}
+```
+
+## Evaluation plot
+
+```{r}
+#**모델마다 나오는 정확도**
+model <- rownames(accuracy)
+accuracy$model <- model
+
+ggplot(accuracy, aes(x = model, y = accuracy, fill = model))+
+  geom_bar(stat = 'identity')+
+  geom_text(aes(label = sprintf('%.4f',accuracy)), size = 5, vjust = 3)+
+  theme(axis.text.x = element_text(size = 30, color = 'black'), axis.title.x = element_blank(), axis.title.y = element_text(size = 30))
+
+ggplot(accuracy, aes(x = model, y = Precision, fill = model))+
+  geom_bar(stat = 'identity')+
+  geom_text(aes(label = sprintf('%.4f',Precision)), size = 5, vjust = 3)+
+  theme(axis.text.x = element_text(size = 30, color = 'black'), axis.title.x = element_blank(), axis.title.y = element_text(size = 30))
+
+ggplot(accuracy, aes(x = model, y = Recall, fill = model))+
+  geom_bar(stat = 'identity')+
+  geom_text(aes(label = sprintf('%.4f',Recall)), size = 5, vjust = 3)+
+  theme(axis.text.x = element_text(size = 30, color = 'black'), axis.title.x = element_blank(), axis.title.y = element_text(size = 30))
+
+ggplot(accuracy, aes(x = model, y = F1, fill = model))+
+  geom_bar(stat = 'identity')+
+  geom_text(aes(label = sprintf('%.4f',F1)), size = 5, vjust = 3)+
+  theme(axis.text.x = element_text(size = 30, color = 'black'), axis.title.x = element_blank(), axis.title.y = element_text(size = 30))
+```
+
+```{r}
+stopCluster(core_num_for_para)
+```
