@@ -31,6 +31,14 @@
 
 https://www.kaggle.com/competitions/playground-series-s3e24
 
+<br/>
+
+**File Name**
+
+smoking.csv
+
+<br/>
+
 **Size**
 
 159,256 * 24
